@@ -6,7 +6,6 @@
 #include "urihelper.h"
 #include "uriinputdialog.h"
 #include "sharedialog.h"
-#include "logdialog.h"
 #include "settingsdialog.h"
 #include "qrcodecapturer.h"
 
@@ -15,20 +14,23 @@
 #include <QFileDialog>
 #include <QMessageBox>
 #include <QCloseEvent>
-#include <botan/version.h>
+#include <QLocalSocket>
 
 MainWindow::MainWindow(ConfigHelper *confHelper, QWidget *parent) :
     QMainWindow(parent),
     ui(new Ui::MainWindow),
-    configHelper(confHelper)
+    configHelper(confHelper),
+    instanceRunning(false)
 {
     Q_ASSERT(configHelper);
+
+    initSingleInstance();
 
     ui->setupUi(this);
 
     //setup Settings menu
 #ifndef Q_OS_DARWIN
-	ui->menuSettings->addAction(ui->toolBar->toggleViewAction());
+    ui->menuSettings->addAction(ui->toolBar->toggleViewAction());
 #endif
 
     //initialisation
@@ -95,8 +97,6 @@ MainWindow::MainWindow(ConfigHelper *confHelper, QWidget *parent) :
             this, &MainWindow::onDisconnect);
     connect(ui->actionTestLatency, &QAction::triggered,
             this, &MainWindow::onLatencyTest);
-    connect(ui->actionViewLog, &QAction::triggered,
-            this, &MainWindow::onViewLog);
     connect(ui->actionMoveUp, &QAction::triggered, this, &MainWindow::onMoveUp);
     connect(ui->actionMoveDown, &QAction::triggered,
             this, &MainWindow::onMoveDown);
@@ -118,10 +118,10 @@ MainWindow::MainWindow(ConfigHelper *confHelper, QWidget *parent) :
 
     connect(ui->connectionView, &QTableView::clicked,
             this, static_cast<void (MainWindow::*)(const QModelIndex&)>
-                  (&MainWindow::checkCurrentIndex));
+            (&MainWindow::checkCurrentIndex));
     connect(ui->connectionView, &QTableView::activated,
             this, static_cast<void (MainWindow::*)(const QModelIndex&)>
-                  (&MainWindow::checkCurrentIndex));
+            (&MainWindow::checkCurrentIndex));
     connect(ui->connectionView, &QTableView::doubleClicked,
             this, &MainWindow::onEdit);
 
@@ -339,16 +339,6 @@ void MainWindow::onLatencyTest()
                    row())->testLatency();
 }
 
-void MainWindow::onViewLog()
-{
-    Connection *con = model->getItem(
-                proxyModel->mapToSource(ui->connectionView->currentIndex()).
-                row())->getConnection();
-    LogDialog *logDlg = new LogDialog(con, this);
-    connect(logDlg, &LogDialog::finished, logDlg, &LogDialog::deleteLater);
-    logDlg->exec();
-}
-
 void MainWindow::onMoveUp()
 {
     QModelIndex proxyIndex = ui->connectionView->currentIndex();
@@ -382,6 +372,7 @@ void MainWindow::onGeneralSettings()
             sDlg, &SettingsDialog::deleteLater);
     if (sDlg->exec()) {
         configHelper->save(*model);
+        configHelper->setStartAtLogin();
     }
 }
 
@@ -420,7 +411,6 @@ void MainWindow::checkCurrentIndex(const QModelIndex &_index)
     ui->actionEdit->setEnabled(valid);
     ui->actionDelete->setEnabled(valid);
     ui->actionShare->setEnabled(valid);
-    ui->actionViewLog->setEnabled(valid);
     ui->actionMoveUp->setEnabled(valid ? _index.row() > 0 : false);
     ui->actionMoveDown->setEnabled(valid ?
                                    _index.row() < model->rowCount() - 1 :
@@ -442,9 +432,8 @@ void MainWindow::checkCurrentIndex(const QModelIndex &_index)
 void MainWindow::onAbout()
 {
     QString text = QString("<h1>Shadowsocks-Qt5</h1><p><b>Version %1</b><br />"
-            "Using libQtShadowsocks %2<br />"
-            "Using Botan %3.%4.%5</p>"
-            "<p>Copyright © 2014-2016 Symeon Huang "
+            "Using libQtShadowsocks %2</p>"
+            "<p>Copyright © 2014-2017 Symeon Huang "
             "(<a href='https://twitter.com/librehat'>"
             "@librehat</a>)</p>"
             "<p>License: <a href='http://www.gnu.org/licenses/lgpl.html'>"
@@ -453,10 +442,7 @@ void MainWindow::onAbout()
             "<a href='https://github.com/shadowsocks/shadowsocks-qt5'>"
             "GitHub</a></p>")
             .arg(QStringLiteral(APP_VERSION))
-            .arg(QSS::Common::version().data())
-            .arg(Botan::version_major())
-            .arg(Botan::version_minor())
-            .arg(Botan::version_patch());
+            .arg(QSS::Common::version());
     QMessageBox::about(this, tr("About"), text);
 }
 
@@ -525,7 +511,7 @@ void MainWindow::setupActionIcon()
     ui->actionEdit->setIcon(QIcon::fromTheme("document-edit",
                             QIcon::fromTheme("accessories-text-editor")));
     ui->actionShare->setIcon(QIcon::fromTheme("document-share",
-                     QIcon::fromTheme("preferences-system-sharing")));
+                             QIcon::fromTheme("preferences-system-sharing")));
     ui->actionTestLatency->setIcon(QIcon::fromTheme("flag",
                                    QIcon::fromTheme("starred")));
     ui->actionImportGUIJson->setIcon(QIcon::fromTheme("document-import",
@@ -539,10 +525,71 @@ void MainWindow::setupActionIcon()
     ui->actionQRCode->setIcon(QIcon::fromTheme("edit-image-face-recognize",
                               QIcon::fromTheme("insert-image")));
     ui->actionScanQRCodeCapturer->setIcon(ui->actionQRCode->icon());
-    ui->actionViewLog->setIcon(QIcon::fromTheme("view-list-text",
-                               QIcon::fromTheme("text-x-preview")));
     ui->actionGeneralSettings->setIcon(QIcon::fromTheme("configure",
-                                   QIcon::fromTheme("preferences-desktop")));
+                                       QIcon::fromTheme("preferences-desktop")));
     ui->actionReportBug->setIcon(QIcon::fromTheme("tools-report-bug",
                                  QIcon::fromTheme("help-faq")));
+}
+
+bool MainWindow::isInstanceRunning() const
+{
+    return instanceRunning;
+}
+
+void MainWindow::initSingleInstance()
+{
+    const QString serverName = QCoreApplication::applicationName();
+    QLocalSocket socket;
+    socket.connectToServer(serverName);
+    if (socket.waitForConnected(500)) {
+        instanceRunning = true;
+        if (configHelper->isOnlyOneInstance()) {
+            qWarning() << "An instance of ss-qt5 is already running";
+        }
+        QByteArray username = qgetenv("USER");
+        if (username.isEmpty()) {
+            username = qgetenv("USERNAME");
+        }
+        socket.write(username);
+        socket.waitForBytesWritten();
+        return;
+    }
+
+    /* Can't connect to server, indicating it's the first instance of the user */
+    instanceServer = new QLocalServer(this);
+    instanceServer->setSocketOptions(QLocalServer::WorldAccessOption);
+    connect(instanceServer, &QLocalServer::newConnection,
+            this, &MainWindow::onSingleInstanceConnect);
+    if (instanceServer->listen(serverName)) {
+        /* Remove server in case of crashes */
+        if (instanceServer->serverError() == QAbstractSocket::AddressInUseError &&
+                QFile::exists(instanceServer->serverName())) {
+            QFile::remove(instanceServer->serverName());
+            instanceServer->listen(serverName);
+        }
+    }
+}
+
+void MainWindow::onSingleInstanceConnect()
+{
+    QLocalSocket *socket = instanceServer->nextPendingConnection();
+    if (!socket) {
+        return;
+    }
+
+    if (socket->waitForReadyRead(1000)) {
+        QByteArray username = qgetenv("USER");
+        if (username.isEmpty()) {
+            username = qgetenv("USERNAME");
+        }
+
+        QByteArray recvUsername = socket->readAll();
+        if (recvUsername == username) {
+            // Only show the window if it's the same user
+            show();
+        } else {
+            qWarning("Another user is trying to run another instance of ss-qt5");
+        }
+    }
+    socket->deleteLater();
 }
